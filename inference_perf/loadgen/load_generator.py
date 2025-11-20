@@ -11,13 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from pathlib import Path
 from inference_perf.client.metricsclient.base import StageRuntimeInfo, StageStatus
-from .load_timer import LoadTimer, ConstantLoadTimer, PoissonLoadTimer
-from inference_perf.datagen import DataGenerator
+from inference_perf.utils.trace_reader import AzurePublicDatasetReader
+from inference_perf.utils.request_queue import RequestQueue
+from .load_timer import LoadTimer, ConstantLoadTimer, PoissonLoadTimer, TraceReplayLoadTimer
+from inference_perf.datagen import DataGenerator, LazyLoadDataMixin
 from inference_perf.apis import InferenceAPIData
 from inference_perf.client.modelserver import ModelServerClient
 from inference_perf.circuit_breaker import get_circuit_breaker
-from inference_perf.config import LoadConfig, LoadStage, LoadType, StageGenType
+from inference_perf.config import (
+    LoadConfig,
+    LoadType,
+    StageGenType,
+    TraceFormat,
+    ConcurrentLoadStage,
+    StandardLoadStage,
+)
 from asyncio import (
     CancelledError,
     Semaphore,
@@ -61,6 +71,7 @@ class Worker(mp.Process):
         request_phase: SyncEvent,
         finished_requests_counter: "Synchronized[int]",
         active_requests_counter: "Synchronized[int]",
+        shared_max_concurrency: Optional["Synchronized[int]"],
     ):
         super().__init__(daemon=True)  # kill worker process if main process exit unexpected
         self.id = id
@@ -73,16 +84,41 @@ class Worker(mp.Process):
         self.request_phase = request_phase
         self.finished_requests_counter = finished_requests_counter
         self.active_requests_counter = active_requests_counter
+        self.shared_max_concurrency = shared_max_concurrency
+        self.skip = False
 
     async def loop(self) -> None:
+        # The self.shared_max_concurrency is initialized to self.max_concurrency
         semaphore = Semaphore(self.max_concurrency)
+        current_concurrency = self.max_concurrency
         tasks = []
         event_loop = get_event_loop()
         item = None
         timeout = 0.5
 
         while not self.stop_signal.is_set():
-            while self.request_phase.is_set() and not self.cancel_signal.is_set():
+            # Check if max_concurrency has been updated and recreate semaphore if needed (concurrent load type)
+            if self.shared_max_concurrency and not self.skip:
+                with self.shared_max_concurrency.get_lock():
+                    new_concurrency = self.shared_max_concurrency.value
+                if new_concurrency == 0:
+                    self.skip = True
+                elif new_concurrency != current_concurrency:
+                    logger.debug(f"[Worker {self.id}] updating semaphore from {current_concurrency} to {new_concurrency}")
+                    # Wait for all current semaphore permits to be released
+                    for _ in range(current_concurrency):
+                        await semaphore.acquire()
+                    # Create new semaphore with updated limit
+                    semaphore = Semaphore(new_concurrency)
+                    current_concurrency = new_concurrency
+
+            if not self.skip:
+                logger.debug(f"Worker {self.id} is currently working")
+            else:
+                await sleep(0)
+
+            # Process requests in loop
+            while self.request_phase.is_set() and not self.cancel_signal.is_set() and not self.skip:
                 await semaphore.acquire()
                 try:
                     # Use partial to pass named arg
@@ -108,6 +144,7 @@ class Worker(mp.Process):
                     request_data: InferenceAPIData,
                     request_time: float,
                     stage_id: int,
+                    semaphore: Semaphore,
                 ) -> None:
                     inflight = False
                     try:
@@ -131,10 +168,13 @@ class Worker(mp.Process):
                         semaphore.release()
 
                 stage_id, request, request_time = item
-                request_data = self.datagen.get_request(request) if isinstance(request, int) else request
-                task = create_task(schedule_client(self.request_queue, request_data, request_time, stage_id))
+                request_data = LazyLoadDataMixin.get_request(self.datagen, request)
+                task = create_task(schedule_client(self.request_queue, request_data, request_time, stage_id, semaphore))
                 tasks.append(task)
                 await sleep(0)
+
+            # Reset skip
+            self.skip = False
 
             if self.cancel_signal.is_set():
                 logger.debug(f"[Worker {self.id}] cancelling tasks with {self.active_requests_counter.value} active requests")
@@ -166,20 +206,48 @@ class LoadGenerator:
         self.stages = load_config.stages
         self.stage_runtime_info = dict[int, StageRuntimeInfo]()
         self.num_workers = load_config.num_workers
-        self.workers: List[Worker] = []
         self.worker_max_concurrency = load_config.worker_max_concurrency
+        self.workers: List[Worker] = []
         self.circuit_breakers = [get_circuit_breaker(breaker_name) for breaker_name in load_config.circuit_breakers]
         self.sweep_config = load_config.sweep
         self.interrupt_sig = False
         signal.signal(signal.SIGINT, self._sigint_handler)
+        if self.load_type == LoadType.TRACE_REPLAY:
+            self.trace = load_config.trace
+
+            if self.trace is None:
+                raise ValueError("Trace file is required for trace replay load generator")
+
+            if self.trace.format == TraceFormat.AZURE_PUBLIC_DATASET:
+                self.trace_reader = AzurePublicDatasetReader()
+            else:
+                raise ValueError(f"Unsupported trace format: {self.trace.format}")
 
     def _sigint_handler(self, _signum: int, _frame: Optional[FrameType]) -> None:
         """SIGINT handler that sets interrup_sig flag to True"""
         self.interrupt_sig = True
 
+    def _set_worker_concurrency(self, concurrency_level: int) -> None:
+        """Determines the per worker concurrency, handling cases where concurrency_level % num_workers != 0."""
+        # Calculate new concurrency for worker (concurrency_level will always be > 0)
+        new_concurrency = concurrency_level // self.num_workers + 1
+        # Calculate index cutoff for workers with +1 concurrency
+        remainder = concurrency_level % self.num_workers
+        for worker in self.workers:
+            worker_concurrency = new_concurrency + 1 if worker.id < remainder else new_concurrency
+            # Update the shared concurrency value to signal the worker to update its semaphore (needs to be synchronized with main process)
+            if worker.shared_max_concurrency:
+                with worker.shared_max_concurrency.get_lock():
+                    worker.shared_max_concurrency.value = worker_concurrency
+
     def get_timer(self, rate: float, duration: float) -> LoadTimer:
         if self.load_type == LoadType.POISSON:
             return PoissonLoadTimer(rate=rate, duration=duration)
+        elif self.load_type == LoadType.TRACE_REPLAY:
+            if self.trace is None:
+                raise ValueError("Trace configuration is required for trace replay load generator")
+            return TraceReplayLoadTimer(trace_reader=self.trace_reader, trace_file=Path(self.trace.file))
+        # For concurrent and constant load types (rate is adjusted in main.py for concurrent load type)
         return ConstantLoadTimer(rate=rate, duration=duration)
 
     async def drain(self, queue: mp.Queue) -> None:  # type: ignore[type-arg]
@@ -197,12 +265,13 @@ class LoadGenerator:
         stage_id: int,
         rate: float,
         duration: int,
-        request_queue: mp.Queue,  # type: ignore[type-arg]
+        request_queue: RequestQueue[RequestQueueData],
         active_requests_counter: "Synchronized[int]",
         finished_requests_counter: "Synchronized[int]",
         request_phase: SyncEvent,
         cancel_signal: Optional[SyncEvent] = None,
         timeout: Optional[float] = None,
+        concurrency_level: Optional[int] = None,
     ) -> None:
         logger.info("Stage %d - run started", stage_id)
 
@@ -218,20 +287,19 @@ class LoadGenerator:
         # don't miss the initial scheuled request times
         start_time_epoch = time.time()
         start_time = time.perf_counter() + 1
-        num_requests = int(rate * duration)
+
+        if self.datagen.trace is not None:
+            num_requests = self.datagen.get_request_count()
+        else:
+            num_requests = int(rate * duration)
+
         stage_status = StageStatus.RUNNING
 
         time_generator = timer.start_timer(start_time)
-        if hasattr(self.datagen, "get_request"):
-            # Datagen supports deferring to workers, enqueue request number
-            for request_number in range(num_requests):
-                request_time = next(time_generator)
-                request_queue.put((stage_id, request_number, request_time))
-        else:
-            # Datagen requires queueing request_data
-            data_generator = self.datagen.get_data()
-            for _ in range(num_requests):
-                request_queue.put((stage_id, next(data_generator), next(time_generator)))
+        data_generator = self.datagen.get_data()
+        for _ in range(num_requests):
+            request_data = next(data_generator)
+            request_queue.put((stage_id, request_data, next(time_generator)), request_data.prefered_worker_id)
 
         # Wait until all requests are finished processing
         with tqdm(total=1.0, desc=f"Stage {stage_id} progress") as pbar:
@@ -268,7 +336,7 @@ class LoadGenerator:
             await sleep(1)
             while active_requests_counter.value > 0:
                 await sleep(1)
-            await self.drain(request_queue)
+            request_queue.drain()
             cancel_signal.clear()
             stage_status = StageStatus.FAILED
         else:
@@ -278,14 +346,19 @@ class LoadGenerator:
         request_queue.join()
 
         self.stage_runtime_info[stage_id] = StageRuntimeInfo(
-            stage_id=stage_id, rate=rate, start_time=start_time_epoch, end_time=time.time(), status=stage_status
+            stage_id=stage_id,
+            rate=rate,
+            start_time=start_time_epoch,
+            end_time=time.time(),
+            status=stage_status,
+            concurrency_level=concurrency_level,
         )
         logger.info("Stage %d - run completed" if stage_status == StageStatus.COMPLETED else "Stage %d - run failed", stage_id)
 
     async def preprocess(
         self,
         client: ModelServerClient,
-        request_queue: mp.Queue,  # type: ignore[type-arg]
+        request_queue: RequestQueue[RequestQueueData],
         active_requests_counter: "Synchronized[int]",
         finished_requests_counter: "Synchronized[int]",
         request_phase: SyncEvent,
@@ -364,11 +437,13 @@ class LoadGenerator:
                 return [float(round(r, 2)) for r in np.linspace(1, target_request_rate, size)]
 
         rates = generateRates(saturation_point, self.sweep_config.num_stages, self.sweep_config.type)
-        self.stages = [LoadStage(rate=r, duration=self.sweep_config.stage_duration) for r in rates]
+        self.stages = [StandardLoadStage(rate=r, duration=self.sweep_config.stage_duration) for r in rates]
         logger.info(f"Generated load stages: {[s.rate for s in self.stages]}")
 
     async def mp_run(self, client: ModelServerClient) -> None:
-        request_queue: mp.Queue[RequestQueueData] = mp.JoinableQueue()
+        request_queue: RequestQueue[RequestQueueData] = RequestQueue(
+            self.num_workers if self.datagen.is_prefered_worker_requested() else 1
+        )
         finished_requests_counter: "Synchronized[int]" = mp.Value("i", 0)
         active_requests_counter: "Synchronized[int]" = mp.Value("i", 0)
         request_phase: SyncEvent = mp.Event()
@@ -377,12 +452,19 @@ class LoadGenerator:
         # start workers in the request phase
         request_phase.set()
 
+        # Create list of workers to process requests
         for id in range(self.num_workers):
+            # Create shared value for each worker's max concurrency if concurrent load type
+            if self.load_type == LoadType.CONCURRENT:
+                shared_max_concurrency = mp.Value("i", self.worker_max_concurrency)
+            else:
+                shared_max_concurrency = None
+
             self.workers.append(
                 Worker(
                     id,
                     client,
-                    request_queue,
+                    request_queue.get_channel(id),
                     self.datagen,
                     self.worker_max_concurrency,
                     stop_signal,
@@ -390,6 +472,7 @@ class LoadGenerator:
                     request_phase,
                     finished_requests_counter,
                     active_requests_counter,
+                    shared_max_concurrency,
                 )
             )
             self.workers[-1].start()
@@ -405,15 +488,32 @@ class LoadGenerator:
                 return
 
         for stage_id, stage in enumerate(self.stages):
+            # Update worker concurrency for concurrent load type
+            if self.load_type == LoadType.CONCURRENT and isinstance(stage, ConcurrentLoadStage):
+                logger.debug(f"Setting worker concurrency to {stage.concurrency_level} for stage {stage_id}")
+                self._set_worker_concurrency(stage.concurrency_level)
+
+                # Use the dynamically set rate/duration from main.py
+                rate = getattr(stage, "rate", stage.num_requests)
+                duration = getattr(stage, "duration", 1)
+                concurrency_level = stage.concurrency_level
+            elif self.load_type != LoadType.CONCURRENT and isinstance(stage, StandardLoadStage):
+                rate = stage.rate
+                duration = stage.duration
+                concurrency_level = None
+            else:
+                raise Exception(f"Stage {stage_id} has the wrong load type")
+
             await self.run_stage(
                 stage_id,
-                stage.rate,
-                stage.duration,
+                rate,
+                duration,
                 request_queue,
                 active_requests_counter,
                 finished_requests_counter,
                 request_phase,
                 cancel_signal,
+                concurrency_level=concurrency_level,
             )
             # If we encountered a SIGINT, we can break out of run stages loop
             if self.interrupt_sig:
@@ -439,6 +539,7 @@ class LoadGenerator:
             async with TaskGroup() as tg:
                 time_generator = timer.start_timer(start_time)
                 for _, (data, time_index) in enumerate(zip(self.datagen.get_data(), time_generator, strict=True)):
+                    request_data = LazyLoadDataMixin.get_request(self.datagen, data)
                     if cb := next((cb for cb in self.circuit_breakers if cb.is_open()), None):
                         logger.warning(f'Loadgen detects circuit breakers "{cb.name}" open, clean up stage and exit early.')
                         stage_status = StageStatus.FAILED
@@ -453,7 +554,7 @@ class LoadGenerator:
                             break
                         if time_index > now:
                             await sleep(time_index - time.perf_counter())
-                        tg.create_task(client.process_request(data, stage_id, time_index))
+                        tg.create_task(client.process_request(request_data, stage_id, time_index))
                         continue
                     else:
                         break
@@ -463,7 +564,12 @@ class LoadGenerator:
             else:
                 logger.info("Stage %d - run failed", stage_id)
             self.stage_runtime_info[stage_id] = StageRuntimeInfo(
-                stage_id=stage_id, rate=stage.rate, start_time=start_time_epoch, end_time=time.time(), status=stage_status
+                stage_id=stage_id,
+                rate=stage.rate,
+                start_time=start_time_epoch,
+                end_time=time.time(),
+                status=stage_status,
+                concurrency_level=None,
             )
             if self.stageInterval and stage_id < len(self.stages) - 1:
                 await sleep(self.stageInterval)

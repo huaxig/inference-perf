@@ -26,6 +26,7 @@ from inference_perf.config import APIConfig, APIType
 class CompletionAPIData(InferenceAPIData):
     prompt: str
     max_tokens: int = 0
+    model_response: str = ""
 
     def get_api_type(self) -> APIType:
         return APIType.Completion
@@ -33,7 +34,7 @@ class CompletionAPIData(InferenceAPIData):
     def get_route(self) -> str:
         return "/v1/completions"
 
-    def to_payload(self, model_name: str, max_tokens: int, ignore_eos: bool, streaming: bool) -> dict[str, Any]:
+    async def to_payload(self, model_name: str, max_tokens: int, ignore_eos: bool, streaming: bool) -> dict[str, Any]:
         if self.max_tokens == 0:
             self.max_tokens = max_tokens
         return {
@@ -48,20 +49,31 @@ class CompletionAPIData(InferenceAPIData):
         if config.streaming:
             output_text = ""
             output_token_times: List[float] = []
-            async for chunk_bytes in response.content:
-                chunk_bytes = chunk_bytes.strip()
-                output_token_times.append(time.perf_counter())
-                if not chunk_bytes:
-                    continue
-                # After removing the "data: " prefix, each chunk decodes to a response json for a single token or "[DONE]" if end of stream
-                chunk = chunk_bytes.decode("utf-8").removeprefix("data: ")
-                if chunk != "[DONE]":
-                    data = json.loads(chunk)
-                    if choices := data.get("choices"):
-                        text = choices[0].get("text")
-                        output_text += text
+            buffer = b""
+            async for chunk in response.content.iter_any():
+                buffer += chunk
+                while b"\n\n" in buffer:
+                    message, buffer = buffer.split(b"\n\n", 1)
+                    output_token_times.append(time.perf_counter())
+                    for line in message.split(b"\n"):
+                        if line.startswith(b"data:"):
+                            data_str = line.removeprefix(b"data: ").strip()
+                            if data_str == b"[DONE]":
+                                break
+                            try:
+                                data = json.loads(data_str)
+                                if choices := data.get("choices"):
+                                    text = choices[0].get("text")
+                                    output_text += text
+                            except (json.JSONDecodeError, IndexError):
+                                continue
+                    else:
+                        continue
+                    break
+
             prompt_len = tokenizer.count_tokens(self.prompt)
             output_len = tokenizer.count_tokens(output_text)
+            self.model_response = output_text
             return InferenceInfo(
                 input_tokens=prompt_len,
                 output_tokens=output_len,
@@ -75,4 +87,5 @@ class CompletionAPIData(InferenceAPIData):
                 return InferenceInfo(input_tokens=prompt_len)
             output_text = choices[0].get("text", "")
             output_len = tokenizer.count_tokens(output_text)
+            self.model_response = output_text
             return InferenceInfo(input_tokens=prompt_len, output_tokens=output_len)

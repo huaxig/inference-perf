@@ -14,15 +14,25 @@ spec:
         app: inference-perf
     spec:
       restartPolicy: Never
+      serviceAccountName: {{ .Values.job.serviceAccountName }}
       {{- with .Values.job.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 {{- if .Values.gcsPath}}
       initContainers:
-        - name: fetch-dataset
+        - name: fetch-gcs-dataset
           image: google/cloud-sdk:latest
-          command: ["sh", "-c", "gsutil cp {{ .Values.gcsPath }} /dataset/dataset.json"]
+          command: ["sh", "-c", "gsutil cp {{ .Values.gcsPath }} /dataset/gcs-dataset.json"]
+          volumeMounts:
+            - name: dataset-volume
+              mountPath: /dataset
+{{- end }}
+{{- if .Values.s3Path}}
+      initContainers:
+        - name: fetch-s3-dataset
+          image: google/cloud-sdk:latest
+          command: ["sh", "-c", "aws s3 cp s3://{{ .Values.s3Path }} /dataset/s3-dataset.json"]
           volumeMounts:
             - name: dataset-volume
               mountPath: /dataset
@@ -37,12 +47,18 @@ spec:
             - "--log-level"
             - {{ .Values.logLevel }}
           env:
-            {{- if .Values.hfToken }}
-            - name: HF_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "inference-perf.hfSecret" . }}
-                  key: {{ include "inference-perf.hfKey" . }}
+            {{- if and .Values.token.hfSecret.name .Values.token.hfSecret.key }}
+                        - name: HF_TOKEN
+                          valueFrom:
+                            secretKeyRef:
+                              name: {{ .Values.token.hfSecret.name }}
+                              key: {{ .Values.token.hfSecret.key }}
+            {{- else if .Values.token.hfToken }}
+                        - name: HF_TOKEN
+                          valueFrom:
+                            secretKeyRef:
+                              name: {{ include "inference-perf.hfSecret" . }}
+                              key: {{ include "inference-perf.hfKey" . }}
             {{- end }}
           volumeMounts:
             - name: config-volume

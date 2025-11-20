@@ -67,11 +67,13 @@ Defines the benchmarking load pattern:
 
 ```yaml
 load:
-  type: constant|poisson            # Load pattern type
+  type: constant|poisson|concurrent # Load pattern type
   interval: 1.0                     # Seconds between request batches
   stages:                           # Load progression stages
-    - rate: 1                       # Requests per second
-      duration: 30                  # Seconds to maintain this rate
+    - rate: 1                       # Requests per second (CONSTANT or POISSON LOADS)
+      duration: 30                  # Seconds to maintain this rate (CONSTANT or POISSON LOADS)
+      concurrency_level: 3          # Level of concurrency/number of worker threads (CONCURRENT LOADS)
+      num_requests: 40              # Number of requests to be processed by concurrency_level worker threads (CONCURRENT LOADS)
   num_workers: 4                    # Concurrent worker threads (default: CPU_cores)
   worker_max_concurrency: 10        # Max concurrent requests per worker
   worker_max_tcp_connections: 2500  # Max TCP connections per worker
@@ -117,8 +119,31 @@ metrics:
   prometheus:                     # Required when type=prometheus
     url: "http://localhost:9090"  # Prometheus server URL
     scrape_interval: 15           # Metrics scrape interval (seconds)
-    google_managed: false         # Whether using Google Managed Prometheus
+    google_managed: false         # Whether using Google Managed Prometheus (see 'Google Managed Prometheus (GMP) Requirements' section)
     filters: []                   # List of metric names to collect
+```
+
+#### Google Managed Prometheus (GMP) Requirements
+
+When setting `google_managed: true`, `inference-perf` queries the GMP API directly. You must configure [Application Default Credentials (ADC)](https://cloud.google.com/docs/authentication/application-default-credentials) in your environment with sufficient permissions.
+
+1. **Required Permissions**
+   The identity used by ADC must have the Monitoring Viewer role:
+   * `roles/monitoring.viewer`
+
+2. **Environment Configuration**
+   * **GKE Cluster:** Ensure the Pod is running with [Workload Identity](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity) enabled and linked to a Google Service Account (GSA) with the required role.
+   * **GCE VM:** Ensure the [VM's attached Service Account](https://cloud.google.com/compute/docs/access/service-accounts#associating_a_service_account_to_an_instance) has the required role.
+   * **Local Development:** Authenticate using your user credentials:
+     ```bash
+     gcloud auth application-default login
+     ```
+     > **Note:** Your personal user account must have the `monitoring.viewer` role on the target GCP project.
+
+**Common Error:**
+Failing to configure these permissions will result in API errors similar to:
+```text
+ERROR - error executing query: 403 Client Error: Forbidden for url: [https://monitoring.googleapis.com/v1/projects/](https://monitoring.googleapis.com/v1/projects/)...
 ```
 
 ### Reporting

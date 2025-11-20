@@ -16,15 +16,15 @@ from inference_perf.config import CustomTokenizerConfig
 
 
 class CustomTokenizer:
-    def __init__(self, config: CustomTokenizerConfig):
-        self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
+    def __init__(self, config: CustomTokenizerConfig) -> None:
+        self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(  # type: ignore[no-untyped-call]
             config.pretrained_model_name_or_path, token=config.token, trust_remote_code=config.trust_remote_code
-        )  # type: ignore[no-untyped-call]
+        )
 
     def count_tokens(self, text: str) -> int:
         if text == "":
             return 0
-        return len(self.tokenizer(text).input_ids)
+        return len(self.tokenizer(text, truncation=True, max_length=self.tokenizer.model_max_length).input_ids)
 
     def get_tokenizer(self) -> PreTrainedTokenizerBase:
         return self.tokenizer
