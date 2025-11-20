@@ -2,9 +2,9 @@ import pytest
 
 from utils.benchmark import run_benchmark_minimal
 
-@pytest.skip("for test purpose")
-def test_simple_mock_client_benchmark():
-    result = run_benchmark_minimal("e2e/configs/e2e_simple_mock_client.yaml", timeout_sec=None)
+
+def test_vllm_sim_client_benchmark(vllm_sim_server):
+    result = run_benchmark_minimal("e2e/configs/e2e_vllm_sim_client.yaml", timeout_sec=30)
     assert result.success, "Benchmark failed"
     assert result.reports, "No reports generated from benchmark"
     assert result.reports["per_request_lifecycle_metrics.json"], "Missing requests report"
